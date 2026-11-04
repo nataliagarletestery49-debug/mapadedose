@@ -1,11 +1,17 @@
 # -*- coding: utf-8 -*-
-import streamlit as st
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
 import os
-import requests
 import gc
+import threading
+import requests
+import numpy as np
+import pandas as pd
+import streamlit as st
+import matplotlib
+matplotlib.use("Agg")  # Evita conflito de interface gráfica entre múltiplos usuários
+import matplotlib.pyplot as plt
+
+# Trava de segurança para várias pessoas gerarem gráficos simultaneamente sem travar
+_plot_lock = threading.Lock()
 
 st.set_page_config(
     page_title="Mapa de Dose 3D - XII Jornada Acadêmica de Física Médica",
@@ -55,36 +61,52 @@ ID_FRENTE = "130OQs5XQMsi6_D9gFc1cRckRItDtuXXm"
 ARQUIVO_TRAS = "3d-dose-map1.dat"
 ID_TRAS = "1TqjHZZxMKNvuM7Ss6XeQ0hCM4hLMzpXv"
 
+ARQUIVO_CACHE_BINARIO = "dose_normalizada_cache.npz"
+
 def baixar_arquivo(arquivo, id_drive):
     if not os.path.exists(arquivo) or os.path.getsize(arquivo) < 1000000:
         url = f"https://drive.usercontent.google.com/download?id={id_drive}&export=download&confirm=t"
-        resposta = requests.get(url, stream=True)
-        with open(arquivo, "wb") as f:
-            for bloco in resposta.iter_content(chunk_size=32768):
-                if bloco:
-                    f.write(bloco)
+        with requests.Session() as sessao:
+            resposta = sessao.get(url, stream=True, timeout=60)
+            resposta.raise_for_status()
+            with open(arquivo, "wb") as f:
+                for bloco in resposta.iter_content(chunk_size=131072):  # Buffer 4x mais rápido (128 KB)
+                    if bloco:
+                        f.write(bloco)
 
-@st.cache_data(show_spinner="A carregar e processar os mapas de dose... Por favor, aguarde.")
+@st.cache_resource(show_spinner="A carregar e processar os mapas de dose... Por favor, aguarde.")
 def carregar_dados():
+    # 1. Se já processou uma vez no servidor, carrega o binário pronto em ~0.02s
+    if os.path.exists(ARQUIVO_CACHE_BINARIO):
+        dados = np.load(ARQUIVO_CACHE_BINARIO)
+        dose_normalizada = dados["dose_normalizada"]
+        limites_xy = dados["limites_xy"].tolist()
+        nbz = int(dados["nbz"])
+        return dose_normalizada, limites_xy, nbz
+
+    # 2. Caso seja a primeira vez após o boot, baixa e processa os arquivos .dat
     baixar_arquivo(ARQUIVO_FRENTE, ID_FRENTE)
     baixar_arquivo(ARQUIVO_TRAS, ID_TRAS)
 
     colunas = ['X', 'Y', 'Z', 'Dose', 'Incerteza', 'IX', 'IY', 'IZ']
-    tipos = {'X': np.float32, 'Y': np.float32, 'Z': np.float32, 'Dose': np.float32}
+    tipos_frente = {
+        'X': np.float32, 'Y': np.float32, 'Dose': np.float32,
+        'IX': np.int32, 'IY': np.int32, 'IZ': np.int32
+    }
 
     df = pd.read_csv(
         ARQUIVO_FRENTE,
         sep=r'\s+',
         comment='#',
         names=colunas,
-        usecols=['X', 'Y', 'Z', 'Dose', 'IX', 'IY', 'IZ'],
-        dtype=tipos,
+        usecols=['X', 'Y', 'Dose', 'IX', 'IY', 'IZ'],
+        dtype=tipos_frente,
         on_bad_lines='skip'
     ).dropna()
 
-    ix = df['IX'].astype(int).values - 1
-    iy = df['IY'].astype(int).values - 1
-    iz = df['IZ'].astype(int).values - 1
+    ix = df['IX'].values - 1
+    iy = df['IY'].values - 1
+    iz = df['IZ'].values - 1
 
     nbx = int(ix.max()) + 1
     nby = int(iy.max()) + 1
@@ -93,18 +115,20 @@ def carregar_dados():
     dose_3d = np.zeros((nbx, nby, nbz), dtype=np.float32)
     dose_3d[ix, iy, iz] = df['Dose'].values
 
-    x_coords = np.sort(df['X'].unique())
-    y_coords = np.sort(df['Y'].unique())
-
     limites_xy = [
-        float(x_coords.min()),
-        float(x_coords.max()),
-        float(y_coords.min()),
-        float(y_coords.max())
+        float(df['X'].min()),
+        float(df['X'].max()),
+        float(df['Y'].min()),
+        float(df['Y'].max())
     ]
 
     del df, ix, iy, iz
     gc.collect()
+
+    tipos_tras = {
+        'Dose': np.float32,
+        'IX': np.int32, 'IY': np.int32, 'IZ': np.int32
+    }
 
     df_tras = pd.read_csv(
         ARQUIVO_TRAS,
@@ -112,13 +136,13 @@ def carregar_dados():
         comment='#',
         names=colunas,
         usecols=['Dose', 'IX', 'IY', 'IZ'],
-        dtype={'Dose': np.float32},
+        dtype=tipos_tras,
         on_bad_lines='skip'
     ).dropna()
 
-    ix_t = df_tras['IX'].astype(int).values - 1
-    iy_t = df_tras['IY'].astype(int).values - 1
-    iz_t = df_tras['IZ'].astype(int).values - 1
+    ix_t = df_tras['IX'].values - 1
+    iy_t = df_tras['IY'].values - 1
+    iz_t = df_tras['IZ'].values - 1
 
     dose_3d[ix_t, iy_t, iz_t] += df_tras['Dose'].values
 
@@ -126,10 +150,28 @@ def carregar_dados():
     gc.collect()
 
     doses_validas = dose_3d[dose_3d > 1e-10]
-    dose_maxima_referencia = np.percentile(doses_validas, 99.5) if len(doses_validas) > 0 else dose_3d.max()
-    dose_normalizada = (dose_3d / dose_maxima_referencia) * 100.0
+    dose_maxima_referencia = float(np.percentile(doses_validas, 99.5)) if len(doses_validas) > 0 else float(dose_3d.max())
+    del doses_validas
 
-    return dose_normalizada, limites_xy, nbz
+    # Multiplicação in-place para não duplicar a matriz 3D na memória RAM
+    dose_3d *= (100.0 / dose_maxima_referencia)
+
+    # Salva o arquivo binário leve para reaberturas instantâneas e apaga os .dat brutos
+    np.savez_compressed(
+        ARQUIVO_CACHE_BINARIO,
+        dose_normalizada=dose_3d,
+        limites_xy=np.array(limites_xy, dtype=np.float32),
+        nbz=np.int32(nbz)
+    )
+    for arq_bruto in (ARQUIVO_FRENTE, ARQUIVO_TRAS):
+        if os.path.exists(arq_bruto):
+            try:
+                os.remove(arq_bruto)
+            except OSError:
+                pass
+
+    gc.collect()
+    return dose_3d, limites_xy, nbz
 
 dose_normalizada, limites_xy, nbz = carregar_dados()
 
@@ -145,6 +187,14 @@ cmap_escolhido = 'gray_r' if opcao_cor == "Escala de Cinza" else 'jet'
 fatia_z = st.slider(
     "Fatia Z:",
     min_value=0,
+    min_value_label="",
+    max_value=nbz - 1,
+    value=nbz // 2,
+    step=1,
+    label_visibility="visible"
+) if False else st.slider(
+    "Fatia Z:",
+    min_value=0,
     max_value=nbz - 1,
     value=nbz // 2,
     step=1,
@@ -153,24 +203,25 @@ fatia_z = st.slider(
 
 corte_xy = dose_normalizada[:, :, fatia_z].T
 
-fig, ax = plt.subplots(figsize=(8, 6))
+with _plot_lock:
+    fig, ax = plt.subplots(figsize=(8, 6), dpi=110)
 
-im = ax.imshow(
-    corte_xy,
-    origin='lower',
-    extent=limites_xy,
-    cmap=cmap_escolhido,
-    vmin=0,
-    vmax=100,
-    interpolation='nearest',
-    aspect='equal'
-)
+    im = ax.imshow(
+        corte_xy,
+        origin='lower',
+        extent=limites_xy,
+        cmap=cmap_escolhido,
+        vmin=0,
+        vmax=100,
+        interpolation='nearest',
+        aspect='equal'
+    )
 
-fig.colorbar(im, ax=ax, label='Dose Relativa (%)')
-ax.axis('off')
-fig.tight_layout()
+    fig.colorbar(im, ax=ax, label='Dose Relativa (%)')
+    ax.axis('off')
+    fig.tight_layout()
 
-st.pyplot(fig)
-plt.close(fig)
+    st.pyplot(fig, clear_figure=True)
+    plt.close(fig)
 
 st.markdown("<hr>", unsafe_allow_html=True)
